@@ -327,5 +327,38 @@ def to_glb(
         pbar.close()
     if verbose:
         print("Done")
-    
+
     return textured_mesh
+
+
+def to_usdz(
+    *args,
+    file_path: str = None,
+    **kwargs,
+) -> trimesh.Trimesh:
+    """
+    Convert an extracted mesh to a USDZ file.
+
+    Args:
+        *args: positional arguments for to_glb
+        file_path: path to save the USDZ file (optional)
+        **kwargs: keyword arguments for to_glb
+
+    Returns:
+        trimesh.Trimesh: the textured mesh
+    """
+    import os
+    import zipfile
+    import tempfile
+
+    mesh = to_glb(*args, **kwargs)
+    if file_path is not None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Export as binary USD; trimesh will write textures alongside it
+            usdc_path = os.path.join(tmpdir, "mesh.usdc")
+            mesh.export(usdc_path)
+            # USDZ is a zip archive where all assets must be stored uncompressed
+            with zipfile.ZipFile(file_path, 'w', compression=zipfile.ZIP_STORED) as zf:
+                for fname in sorted(os.listdir(tmpdir)):
+                    zf.write(os.path.join(tmpdir, fname), fname)
+    return mesh
