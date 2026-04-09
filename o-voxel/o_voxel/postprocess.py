@@ -337,7 +337,7 @@ def to_usdz(
     **kwargs,
 ) -> trimesh.Trimesh:
     """
-    Convert an extracted mesh to a USDZ file.
+    Convert an extracted mesh to a USDZ file using pxr (usd-core).
 
     Args:
         *args: positional arguments for to_glb
@@ -350,15 +350,121 @@ def to_usdz(
     import os
     import zipfile
     import tempfile
+    import numpy as np
 
     mesh = to_glb(*args, **kwargs)
     if file_path is not None:
+        try:
+            from pxr import Usd, UsdGeom, UsdShade, Sdf, Gf, Vt
+        except ImportError:
+            raise ImportError("usd-core is required for USDZ export: pip install usd-core")
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Export as binary USD; trimesh will write textures alongside it
-            usdc_path = os.path.join(tmpdir, "mesh.usdc")
-            mesh.export(usdc_path)
-            # USDZ is a zip archive where all assets must be stored uncompressed
+            usda_path = os.path.join(tmpdir, 'model.usda')
+            stage = Usd.Stage.CreateNew(usda_path)
+            UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y)
+            stage.SetMetadata('metersPerUnit', 1.0)
+
+            root = UsdGeom.Xform.Define(stage, '/Root')
+            stage.SetDefaultPrim(root.GetPrim())
+            usd_mesh = UsdGeom.Mesh.Define(stage, '/Root/Mesh')
+
+            # Geometry
+            verts = mesh.vertices.astype(np.float32)
+            faces = mesh.faces.astype(np.int32)
+            usd_mesh.GetPointsAttr().Set(
+                Vt.Vec3fArray([Gf.Vec3f(*v.tolist()) for v in verts])
+            )
+            usd_mesh.GetFaceVertexCountsAttr().Set(Vt.IntArray([3] * len(faces)))
+            usd_mesh.GetFaceVertexIndicesAttr().Set(
+                Vt.IntArray(faces.flatten().tolist())
+            )
+            usd_mesh.GetSubdivisionSchemeAttr().Set('none')
+
+            # Vertex normals
+            if mesh.vertex_normals is not None:
+                norms = mesh.vertex_normals.astype(np.float32)
+                usd_mesh.GetNormalsAttr().Set(
+                    Vt.Vec3fArray([Gf.Vec3f(*n.tolist()) for n in norms])
+                )
+                usd_mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+
+            # UV coordinates
+            has_uvs = hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None
+            if has_uvs:
+                uvs = mesh.visual.uv.astype(np.float32)
+                primvars = UsdGeom.PrimvarsAPI(usd_mesh)
+                st_pv = primvars.CreatePrimvar(
+                    'st', Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex
+                )
+                st_pv.Set(Vt.Vec2fArray([Gf.Vec2f(float(u), float(v)) for u, v in uvs]))
+
+            # Material
+            mat = UsdShade.Material.Define(stage, '/Root/Material')
+            shader = UsdShade.Shader.Define(stage, '/Root/Material/PBR')
+            shader.CreateIdAttr('UsdPreviewSurface')
+            shader.CreateInput('roughness', Sdf.ValueTypeNames.Float).Set(1.0)
+            shader.CreateInput('metallic', Sdf.ValueTypeNames.Float).Set(1.0)
+
+            tex_files = []
+            pbr = getattr(mesh.visual, 'material', None)
+
+            if has_uvs and pbr is not None:
+                # Shared UV reader
+                st_reader = UsdShade.Shader.Define(stage, '/Root/Material/STReader')
+                st_reader.CreateIdAttr('UsdPrimvarReader_float2')
+                st_reader.CreateInput('varname', Sdf.ValueTypeNames.Token).Set('st')
+                st_out = st_reader.CreateOutput('result', Sdf.ValueTypeNames.Float2)
+
+                def _tex_shader(name, fname, color_space):
+                    shd = UsdShade.Shader.Define(stage, f'/Root/Material/{name}')
+                    shd.CreateIdAttr('UsdUVTexture')
+                    shd.CreateInput('file', Sdf.ValueTypeNames.Asset).Set(fname)
+                    shd.CreateInput('st', Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
+                    shd.CreateInput('wrapS', Sdf.ValueTypeNames.Token).Set('repeat')
+                    shd.CreateInput('wrapT', Sdf.ValueTypeNames.Token).Set('repeat')
+                    shd.CreateInput('sourceColorSpace', Sdf.ValueTypeNames.Token).Set(color_space)
+                    return shd
+
+                # Base colour (sRGB RGBA)
+                bc_img = getattr(pbr, 'baseColorTexture', None)
+                if bc_img is not None:
+                    fname = 'baseColor.png'
+                    bc_img.save(os.path.join(tmpdir, fname))
+                    tex_files.append(fname)
+                    shd = _tex_shader('BaseColor', fname, 'sRGB')
+                    shader.CreateInput('diffuseColor', Sdf.ValueTypeNames.Color3f).ConnectToSource(
+                        shd.CreateOutput('rgb', Sdf.ValueTypeNames.Float3)
+                    )
+                    shader.CreateInput('opacity', Sdf.ValueTypeNames.Float).ConnectToSource(
+                        shd.CreateOutput('a', Sdf.ValueTypeNames.Float)
+                    )
+
+                # Metallic-roughness (linear, G=roughness B=metallic)
+                mr_img = getattr(pbr, 'metallicRoughnessTexture', None)
+                if mr_img is not None:
+                    fname = 'metallicRoughness.png'
+                    mr_img.save(os.path.join(tmpdir, fname))
+                    tex_files.append(fname)
+                    shd = _tex_shader('MetallicRoughness', fname, 'raw')
+                    shader.CreateInput('roughness', Sdf.ValueTypeNames.Float).ConnectToSource(
+                        shd.CreateOutput('g', Sdf.ValueTypeNames.Float)
+                    )
+                    shader.CreateInput('metallic', Sdf.ValueTypeNames.Float).ConnectToSource(
+                        shd.CreateOutput('b', Sdf.ValueTypeNames.Float)
+                    )
+
+            mat.CreateSurfaceOutput().ConnectToSource(
+                shader.CreateOutput('surface', Sdf.ValueTypeNames.Token)
+            )
+            UsdShade.MaterialBindingAPI(usd_mesh).Bind(mat)
+
+            stage.GetRootLayer().Save()
+
+            # USDZ = uncompressed ZIP per spec
             with zipfile.ZipFile(file_path, 'w', compression=zipfile.ZIP_STORED) as zf:
-                for fname in sorted(os.listdir(tmpdir)):
+                zf.write(usda_path, 'model.usda')
+                for fname in tex_files:
                     zf.write(os.path.join(tmpdir, fname), fname)
+
     return mesh
